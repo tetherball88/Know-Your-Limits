@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 # Set your project name. This will be the name of your SKSE .dll file.
-project(HelloWorld VERSION 0.0.1 LANGUAGES CXX)
+project(KnowYourLimits VERSION 0.0.1 LANGUAGES CXX)
 
 # #
 # YOU DO NOT NEED TO EDIT ANYTHING BELOW HERE
@@ -14,8 +14,8 @@ project(HelloWorld VERSION 0.0.1 LANGUAGES CXX)
 #
 # To do this automatically, set the `SKYRIM_FOLDER` environment variable
 # to the path of your Skyrim Special Edition folder
-set(PROJECT_NAME "SKSE collision fix")
-set(SKYRIM_MODS_FOLDER "E:\\Skyrim\\mods\\MO2 Development\\mods")
+set(MOD_FOLDER_NAME "Know Your Limits")
+# set(SKYRIM_MODS_FOLDER "C:\\path\\to\\your\\mods\\folder")
 
 # If you're using Mod Organizer 2 or Vortex, you might want this to go inside
 # of your "mods" folder, inside of a subfolder named "<your mod>".
@@ -23,7 +23,9 @@ set(SKYRIM_MODS_FOLDER "E:\\Skyrim\\mods\\MO2 Development\\mods")
 # To do this automatically, set the `SKYRIM_MODS_FOLDER` environment variable
 # to the path of your "mods" folder
 if(DEFINED ENV{SKYRIM_MODS_FOLDER} AND IS_DIRECTORY "$ENV{SKYRIM_MODS_FOLDER}")
-    set(OUTPUT_FOLDER "$ENV{SKYRIM_MODS_FOLDER}/${PROJECT_NAME}")
+    set(OUTPUT_FOLDER "$ENV{SKYRIM_MODS_FOLDER}/${MOD_FOLDER_NAME}")
+elseif(DEFINED SKYRIM_MODS_FOLDER AND IS_DIRECTORY "${SKYRIM_MODS_FOLDER}")
+    set(OUTPUT_FOLDER "${SKYRIM_MODS_FOLDER}/${MOD_FOLDER_NAME}")
 endif()
 
 # Otherwise, you can set OUTPUT_FOLDER to any place you'd like :)
@@ -31,7 +33,7 @@ endif()
 
 # Setup your SKSE plugin as an SKSE plugin!
 find_package(CommonLibSSE CONFIG REQUIRED)
-add_commonlibsse_plugin(${PROJECT_NAME} SOURCES plugin.cpp) # <--- specifies plugin.cpp
+add_commonlibsse_plugin(${PROJECT_NAME} SOURCES plugin.cpp version.rc) # <--- specifies plugin.cpp and version.rc
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23) # <--- use C++23 standard
 target_precompile_headers(${PROJECT_NAME} PRIVATE PCH.h) # <--- PCH.h is required!
 

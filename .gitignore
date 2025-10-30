@@ -1,5 +1,28 @@
+# IDE folders
 .idea
 .vs
-.vscode/settings.json
-build
-cmake-build*
+.vscode
+
+# Build outputs (except final DLL)
+build/
+plugin/build/
+cmake-build*/
+
+# Temporary compiled files
+*.pdb
+*.exp
+*.lib
+*.obj
+*.o
+*.exe
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# vcpkg installed packages (if using manifest mode)
+vcpkg_installed/
+SkyrimSE.code-workspace
+skyrimse.ppj
