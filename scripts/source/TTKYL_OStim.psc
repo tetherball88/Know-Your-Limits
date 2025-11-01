@@ -33,7 +33,7 @@ Function OnChange(string EventName, string StrArg, float numArg, Form Sender) gl
     
     while(i < actions.Length)
         string actionName = OMetadata.GetActionType(sceneId, actions[i])
-        if(TTKYL_Utils.HasAction(actionName, "oral"))
+        if(TTKYL_Utils.HasAction(actionName, ".oral"))
             Actor withPenis = OThread.GetActor(ThreadID, OMetadata.GetActionTarget(sceneId, actions[i]))
             KnowYourLimits.RegisterBoneMonitor( \
                 withPenis, \
@@ -43,7 +43,7 @@ Function OnChange(string EventName, string StrArg, float numArg, Form Sender) gl
                 5.0, \
                 TTKYL_Utils.GetOralThreshold(withPenis) \
             )
-        elseif(TTKYL_Utils.HasAction(actionName, "vaginal"))
+        elseif(TTKYL_Utils.HasAction(actionName, ".vaginal"))
             Actor withPenis = OThread.GetActor(ThreadID, OMetadata.GetActionActor(sceneId, actions[i]))
             KnowYourLimits.RegisterBoneMonitor( \
                 withPenis, \
@@ -53,7 +53,7 @@ Function OnChange(string EventName, string StrArg, float numArg, Form Sender) gl
                 5.0, \
                 TTKYL_Utils.GetVaginalThreshold(withPenis) \
             )
-        elseif(TTKYL_Utils.HasAction(actionName, "anal"))
+        elseif(TTKYL_Utils.HasAction(actionName, ".anal"))
             Actor withPenis = OThread.GetActor(ThreadID, OMetadata.GetActionActor(sceneId, actions[i]))
             KnowYourLimits.RegisterBoneMonitor( \
                 withPenis, \
