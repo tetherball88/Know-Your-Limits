@@ -34,12 +34,16 @@ float Function GetDistance(float[] pos1, float[] pos2) global
 EndFunction
 
 string Function GetPath(string fileName = "config.json") global
-    return "../TT_KnowYourLimits/" + fileName
+    return "../KnowYourLimits/" + fileName
 EndFunction
 
-bool Function HasAction(string actionName, string actionType) global
-    return JsonUtil.FindPathStringElement(GetPath(), actionType + ".actions", actionName) != -1
+bool Function HasOStimAction(string actionName, string actionType) global
+    return JsonUtil.FindPathStringElement(GetPath(), actionType + ".ostimActions", actionName) != -1
 EndFunction
+bool Function HasSexlabTag(string tagName, string actionType) global
+    return JsonUtil.FindPathStringElement(GetPath(), actionType + ".sexlabTags", tagName) != -1
+EndFunction
+
 string Function GetBoneName(string actionType, string defaultBone) global
     return JsonUtil.GetPathStringValue(GetPath(), actionType + ".bone", defaultBone)
 EndFunction
@@ -54,36 +58,41 @@ string Function GetAnalBoneName() global
     return GetBoneName("anal", "NPC Spine [Spn0]")
 EndFunction
 
-
-float Function GetThreshold(Actor akActor, string actionType) global
-    int size = GetPenisSize(akActor)
-    if(JsonUtil.IsPathNumber(GetPath(), "sizes." + size +actionType+".threshold"))
-        return JsonUtil.GetPathFloatValue(GetPath(), "sizes." + size + actionType + ".threshold")
-    endif
-    return JsonUtil.GetPathFloatValue(GetPath(), "sizes.default"+actionType+".threshold", 5.0)
+float Function GetThreshold(string actionType) global
+    return JsonUtil.GetPathFloatValue(GetPath(), "."+actionType+".threshold", 5.0)
 EndFunction
-float Function GetOralThreshold(Actor akActor) global
-    return GetThreshold(akActor, ".oral")
+float Function GetRestoreThreshold(string actionType) global
+    return JsonUtil.GetPathFloatValue(GetPath(), "."+actionType+".restoreThreshold", -5.0)
 EndFunction
-float Function GetVaginalThreshold(Actor akActor) global
-    return GetThreshold(akActor, ".vaginal")
+float Function GetOralThreshold() global
+    return GetThreshold(".oral")
 EndFunction
-float Function GetAnalThreshold(Actor akActor) global
-    return GetThreshold(akActor, ".anal")
+float Function GetOralRestoreThreshold() global
+    return GetRestoreThreshold(".oral")
 EndFunction
-
-string[] Function GetPenisBoneNames(Actor akActor, string actionType) global
-    int size = GetPenisSize(akActor)
-    if(JsonUtil.IsPathArray(GetPath(), "sizes." + size + actionType + ".penisBones"))
-        return JsonUtil.PathStringElements(GetPath(), "sizes." + size + actionType + ".penisBones")
-    endif
-    return JsonUtil.PathStringElements(GetPath(), "sizes.default"+actionType+".penisBones")
+float Function GetVaginalThreshold() global
+    return GetThreshold(".vaginal")
 EndFunction
-
-int Function GetPenisSize(Actor akActor) global
-    return TNG_PapyrusUtil.GetActorSize(akActor)
+float Function GetVaginalRestoreThreshold() global
+    return GetRestoreThreshold(".vaginal")
+EndFunction
+float Function GetAnalThreshold() global
+    return GetThreshold(".anal")
+EndFunction
+float Function GetAnalRestoreThreshold() global
+    return GetRestoreThreshold(".anal")
 EndFunction
 
-bool Function IsExcludedAnimation(string animationName) global
-    return JsonUtil.StringListHas(GetPath("excludeAnimations.json"), "animationsIds", animationName)
+int Function GetIntervalMs() global
+    return JsonUtil.GetPathIntValue(GetPath(), "general.intervalMs", 50)
+EndFunction
+
+Function ApplyIntervalFromConfig() global
+    int intervalMs = GetIntervalMs()
+    KnowYourLimits.SetTickInterval(intervalMs)
+    MiscUtil.PrintConsole("TTKYL: Tick interval set to " + intervalMs + "ms from configuration")
+EndFunction
+
+string[] Function GetPenisBoneNames() global
+    return JsonUtil.PathStringElements(GetPath(), ".penisBones")
 EndFunction

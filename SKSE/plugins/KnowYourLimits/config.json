@@ -1,0 +1,40 @@
+{
+    "general": {
+        "intervalMs": 50
+    },
+    "penisBones": [
+        "NPC Genitals01 [Gen01]",
+        "CME Genitals03 [Gen03]",
+        "CME Genitals04 [Gen04]",
+        "CME Genitals05 [Gen05]",
+        "NPC Genitals06 [Gen06]"
+    ],
+    "oral": {
+        "restoreThreshold": -8.0,
+        "threshold": -3.0,
+        "ostimActions": [
+            "blowjob",
+            "deepthroat"
+        ],
+        "sexlabTags": [],
+        "bone": "NPC Head [Head]"
+    },
+    "vaginal": {
+        "restoreThreshold": -2.0,
+        "threshold": 4.5,
+        "ostimActions": [
+            "vaginalsex"
+        ],
+        "sexlabTags": [],
+        "bone": "NPC Pelvis [Pelv]"
+    },
+    "anal": {
+        "restoreThreshold": -1.0,
+        "threshold": 3.0,
+        "ostimActions": [
+            "analsex"
+        ],
+        "sexlabTags": [],
+        "bone": "NPC Spine [Spn0]"
+    }
+}

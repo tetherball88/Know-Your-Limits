@@ -18,53 +18,49 @@ EndFunction
 Function OnChange(string EventName, string StrArg, float numArg, Form Sender) global
     int ThreadID = numArg as int
     string sceneId = OThread.GetScene(ThreadID)
-    if(TTKYL_Utils.IsExcludedAnimation(sceneId))
-        TTKYL_Utils.RestoreAll(ThreadID)
-        return
-    endif
+    TTKYL_Utils.RestoreAll(ThreadID)
+    KnowYourLimits.StopBoneMonitor()
+    
+    ; wait here to allow animation to transition to new scene and don't catch fake min/max positions during movement
+    Utility.Wait(0.1)
     int[] actions = OMetadata.FindActionsSuperloadCSVv2(sceneId)
     int i = 0
     bool scaledDown = false
-    KnowYourLimits.StopBoneMonitor()
-    if(actions.Length == 0)
-        TTKYL_Utils.RestoreAll(ThreadID)
-        return
-    endif
-    
+
+    string[] penisBones = TTKYL_Utils.GetPenisBoneNames()
+        
     while(i < actions.Length)
         string actionName = OMetadata.GetActionType(sceneId, actions[i])
-        if(TTKYL_Utils.HasAction(actionName, ".oral"))
+        if(TTKYL_Utils.HasOStimAction(actionName, ".oral"))
             Actor withPenis = OThread.GetActor(ThreadID, OMetadata.GetActionTarget(sceneId, actions[i]))
             KnowYourLimits.RegisterBoneMonitor( \
                 withPenis, \
-                TTKYL_Utils.GetPenisBoneNames(withPenis, ".oral"), \
+                penisBones, \
                 OThread.GetActor(ThreadID, OMetadata.GetActionActor(sceneId, actions[i])), \
                 TTKYL_Utils.GetHeadBoneName(), \
-                5.0, \
-                TTKYL_Utils.GetOralThreshold(withPenis) \
+                TTKYL_Utils.GetOralThreshold(), \
+                TTKYL_Utils.GetOralRestoreThreshold() \
             )
-        elseif(TTKYL_Utils.HasAction(actionName, ".vaginal"))
+        elseif(TTKYL_Utils.HasOStimAction(actionName, ".vaginal"))
             Actor withPenis = OThread.GetActor(ThreadID, OMetadata.GetActionActor(sceneId, actions[i]))
             KnowYourLimits.RegisterBoneMonitor( \
                 withPenis, \
-                TTKYL_Utils.GetPenisBoneNames(withPenis, ".vaginal"), \
+                penisBones, \
                 OThread.GetActor(ThreadID, OMetadata.GetActionTarget(sceneId, actions[i])), \
                 TTKYL_Utils.GetVaginalBoneName(), \
-                5.0, \
-                TTKYL_Utils.GetVaginalThreshold(withPenis) \
+                TTKYL_Utils.GetVaginalThreshold(), \
+                TTKYL_Utils.GetVaginalRestoreThreshold() \
             )
-        elseif(TTKYL_Utils.HasAction(actionName, ".anal"))
+        elseif(TTKYL_Utils.HasOStimAction(actionName, ".anal"))
             Actor withPenis = OThread.GetActor(ThreadID, OMetadata.GetActionActor(sceneId, actions[i]))
             KnowYourLimits.RegisterBoneMonitor( \
                 withPenis, \
-                TTKYL_Utils.GetPenisBoneNames(withPenis, ".anal"), \
+                penisBones, \
                 OThread.GetActor(ThreadID, OMetadata.GetActionTarget(sceneId, actions[i])), \
                 TTKYL_Utils.GetAnalBoneName(), \
-                5.0, \
-                TTKYL_Utils.GetAnalThreshold(withPenis) \
+                TTKYL_Utils.GetAnalThreshold(), \
+                TTKYL_Utils.GetAnalRestoreThreshold() \
             )
-        else
-            TTKYL_Utils.RestoreAll(ThreadID)
         endif
         i += 1
     endwhile

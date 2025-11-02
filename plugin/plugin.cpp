@@ -7,14 +7,13 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <unordered_map>
+#include <unordered_map>  // third-party libs may include this, but not used directly in this file
 #include <utility>
 #include <vector>
 
@@ -23,6 +22,7 @@
 #include "RE/R/ReferenceArray.h"
 
 namespace {
+    // Task interface pointer is obtained on demand using SKSE::GetTaskInterface();
     void SetupLogging() {
         auto logDir = SKSE::log::log_directory();
         if (!logDir) {
@@ -103,29 +103,49 @@ namespace {
             std::uint32_t targetHandle{0};
             std::vector<RE::BSFixedString> probeNodes;
             RE::BSFixedString targetNode;
-            std::chrono::steady_clock::time_point expirationTime{};
-            float lifetimeSeconds{0.0f};
+            // monitors are indefinite (stopped via StopBoneMonitor)
             float distanceThreshold{0.0f};
-            std::vector<bool> scaledFlags;
+            float restoreThreshold{0.0f};
+            std::vector<bool> movedFlags;
             bool waitingForBones{false};
+            // Cached bone pointers to avoid per-tick lookups
+            RE::NiPointer<RE::NiAVObject> cachedBaseNode;
+            RE::NiPointer<RE::NiAVObject> cachedTipNode;
+            std::vector<RE::NiPointer<RE::NiAVObject>> cachedMiddleBones;
+            // Track maximum penetration depth reached
+            float maxPenetration{0.0f};
+            // Track maximum penetration beyond threshold to minimize repeated bone updates
+            float maxPenetrationBeyondThreshold{0.0f};
         };
 
         std::mutex s_monitorMutex;
         std::vector<MonitorEntry> s_monitors;
 
-        std::mutex s_scaledMutex;
-        std::unordered_map<std::uint32_t, std::unordered_map<std::string, float>> s_scaledBones;
-
         std::mutex s_uiTickMutex;
         bool s_uiTickActive = false;
         std::chrono::steady_clock::time_point s_lastTickTime{};
 
+        // Configurable tick interval - can be set from Papyrus, defaults to 50ms
+        std::chrono::milliseconds s_tickInterval{50};
+
         // Run the monitor tick at most 4 times per second to avoid UI thread churn.
-        constexpr std::chrono::milliseconds kTickInterval{250};
-        constexpr float kScaledDownScale = 0.1f;
-        constexpr float kScaleTolerance = 0.001f;  // More reasonable than epsilon for scale comparisons
+        constexpr float kPositionTolerance = 0.1f;  // Tolerance for position comparisons
+        constexpr float kMaxBoneOffset = 1.3f;      // Maximum bone offset to prevent runaway feedback
 
         void ProcessTick();
+
+        void SetTickInterval(int intervalMs) {
+            std::lock_guard<std::mutex> lk(s_uiTickMutex);
+            // Clamp interval to reasonable bounds (16ms to 1000ms)
+            int clampedInterval = std::max(16, std::min(1000, intervalMs));
+            s_tickInterval = std::chrono::milliseconds{clampedInterval};
+            SKSE::log::info("Tick interval set to {}ms", clampedInterval);
+        }
+
+        int GetTickInterval() {
+            std::lock_guard<std::mutex> lk(s_uiTickMutex);
+            return static_cast<int>(s_tickInterval.count());
+        }
 
         void QueueTick() {
             std::lock_guard<std::mutex> lk(s_uiTickMutex);
@@ -157,11 +177,11 @@ namespace {
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastTickTime);
 
                 // Sleep on background thread to avoid blocking UI
-                if (elapsed < kTickInterval) {
-                    std::this_thread::sleep_for(kTickInterval - elapsed);
+                if (elapsed < s_tickInterval) {
+                    std::this_thread::sleep_for(s_tickInterval - elapsed);
                 } else {
                     // If we're behind schedule, still sleep a minimum amount
-                    std::this_thread::sleep_for(kTickInterval);
+                    std::this_thread::sleep_for(s_tickInterval);
                 }
 
                 // Queue the actual processing on UI thread
@@ -178,189 +198,97 @@ namespace {
             SKSE::log::info("Monitoring system stopped.");
         }
 
-        void ScaleBoneToTarget(std::uint32_t actorHandle, RE::NiAVObject* node, const RE::BSFixedString& nodeName) {
+        void UpdateNodeWorldData(RE::NiAVObject* node) {
             if (!node) {
                 return;
             }
 
-            const std::string nodeKey{GetNodeLabel(nodeName)};
+            RE::NiPointer<RE::NiAVObject> nodePtr(node);
+            if (nodePtr) {
+                RE::NiUpdateData updateData;
+                nodePtr->UpdateWorldData(&updateData);
+            }
+        }
 
-            // Read the scale first before modifying anything
-            const float originalScale = node->local.scale;
-
-            // Check if scale value is reasonable (not NaN, not inf, not negative)
-            if (!std::isfinite(originalScale) || originalScale < 0.0f) {
-                SKSE::log::warn("Node {} has invalid scale value: {}", nodeKey, originalScale);
+        void RestoreBonePosition(RE::Actor* actor, const RE::BSFixedString& nodeName) {
+            if (!actor) {
                 return;
             }
 
-            {
-                std::lock_guard<std::mutex> lock(s_scaledMutex);
-                auto& actorBones = s_scaledBones[actorHandle];
-                actorBones.try_emplace(nodeKey, originalScale);
+            auto* node = actor->GetNodeByName(nodeName);
+
+            if (!node) {
+                SKSE::log::warn("RestoreBone: bone {} not found on actor {}", nodeName, GetActorName(actor));
+                return;
             }
 
-            if (std::fabs(node->local.scale - kScaledDownScale) > kScaleTolerance) {
-                node->local.scale = kScaledDownScale;
-                // DO NOT call UpdateWorldData - it's not thread-safe and will crash
-                // The game will update world transforms on its next animation frame
+            SKSE::log::info("RestoreBone: {} restoring to originalY={:.3f}", nodeName.c_str(), 0.0f);
+
+            node->local.translate = RE::NiPoint3{0.0f, 0.0f, 0.0f};
+
+            UpdateNodeWorldData(node);
+        }
+
+        RE::NiPointer<RE::Actor> LookupActorByHandle(std::uint32_t handle) {
+            RE::NiPointer<RE::Actor> actor;
+            RE::Actor::LookupByHandle(static_cast<RE::RefHandle>(handle), actor);
+            return actor;
+        }
+
+        void RestoreMiddleBonesForEntry(const Monitoring::MonitorEntry& entry) {
+            RE::NiPointer<RE::Actor> probeActor = LookupActorByHandle(entry.probeHandle);
+            if (!probeActor) {
+                return;
+            }
+
+            for (std::size_t idx = 1; idx < entry.probeNodes.size() - 1; ++idx) {
+                if (entry.movedFlags[idx]) {
+                    RestoreBonePosition(probeActor.get(), entry.probeNodes[idx]);
+                    SKSE::log::info("Restored bone {} for actor {}", GetNodeLabel(entry.probeNodes[idx]),
+                                    GetActorName(probeActor.get()));
+                }
             }
         }
 
-        std::pair<std::size_t, std::size_t> RestoreScaledBones(const std::vector<std::uint32_t>& handles) {
-            std::vector<std::uint32_t> targetHandles = handles;
-            std::vector<std::pair<std::uint32_t, std::vector<std::pair<std::string, float>>>> pending;
-            {
-                std::lock_guard<std::mutex> lock(s_scaledMutex);
-                if (targetHandles.empty()) {
-                    targetHandles.reserve(s_scaledBones.size());
-                    for (const auto& entry : s_scaledBones) {
-                        targetHandles.push_back(entry.first);
-                    }
-                }
-
-                pending.reserve(targetHandles.size());
-                for (const auto handle : targetHandles) {
-                    auto it = s_scaledBones.find(handle);
-                    if (it == s_scaledBones.end()) {
-                        continue;
-                    }
-
-                    std::vector<std::pair<std::string, float>> bones;
-                    bones.reserve(it->second.size());
-                    for (const auto& [nodeName, originalScale] : it->second) {
-                        bones.emplace_back(nodeName, originalScale);
-                    }
-
-                    pending.emplace_back(handle, std::move(bones));
-                    s_scaledBones.erase(it);
-                }
+        void MoveBoneToTarget(RE::Actor* actor, const RE::BSFixedString& nodeName, float penetrationDepth) {
+            if (!actor) {
+                return;
             }
 
-            std::size_t restored = 0;
-            std::size_t processedActors = 0;
-            std::vector<std::pair<std::uint32_t, std::vector<std::pair<std::string, float>>>> deferred;
-            deferred.reserve(pending.size());
-            for (auto& actorEntry : pending) {
-                RE::NiPointer<RE::Actor> actor;
-                if (!RE::Actor::LookupByHandle(static_cast<RE::RefHandle>(actorEntry.first), actor) || !actor) {
-                    continue;
-                }
+            auto* node = actor->GetNodeByName(nodeName);
 
-                if (!actor->Is3DLoaded()) {
-                    // Defer restoration until the actor's 3D is ready; requeue below.
-                    SKSE::log::debug(
-                        "ResetScaledBones deferring restore for {} (handle={:#010x}) because 3D is not loaded.",
-                        GetActorName(actor.get()), actorEntry.first);
-                    deferred.emplace_back(actorEntry.first, std::move(actorEntry.second));
-                    continue;
-                }
+            if (!node) {
+                SKSE::log::warn("MoveBone: bone {} not found on actor {}", nodeName, GetActorName(actor));
+                return;
+            }
+            // Calculate how much to move the bone backwards along Y axis
+            // penetrationDepth is how far beyond threshold the bone has gone
+            float yOffset = -penetrationDepth;
 
-                ++processedActors;
-                for (auto& boneEntry : actorEntry.second) {
-                    RE::BSFixedString nodeName{boneEntry.first.c_str()};
-                    auto* node = actor->GetNodeByName(nodeName);
-                    if (!node) {
-                        continue;
-                    }
+            // Apply offset to ORIGINAL position, not current position
+            RE::NiPoint3 newPos = RE::NiPoint3{0.0f, 0.0f, 0.0f};
+            newPos.y += yOffset;
 
-                    // Check if the scale value is valid before restoring
-                    if (!std::isfinite(boneEntry.second) || boneEntry.second < 0.0f) {
-                        SKSE::log::warn("Skipping restore of {} with invalid scale: {}", boneEntry.first,
-                                        boneEntry.second);
-                        continue;
-                    }
+            // Check if bone is already at target position (within tolerance)
+            const float currentY = node->local.translate.y;
+            const float deltaY = std::abs(currentY - newPos.y);
 
-                    if (std::fabs(node->local.scale - boneEntry.second) > kScaleTolerance) {
-                        node->local.scale = boneEntry.second;
-                        // DO NOT call UpdateWorldData - it's not thread-safe and causes crashes
-                        // The game will automatically update world transforms during its animation update
-                    }
-
-                    ++restored;
-                }
+            if (deltaY < kPositionTolerance) {
+                // Already at target position, no need to update
+                return;
             }
 
-            if (!deferred.empty()) {
-                std::lock_guard<std::mutex> lock(s_scaledMutex);
-                for (auto& deferredEntry : deferred) {
-                    auto& actorBones = s_scaledBones[deferredEntry.first];
-                    for (auto& boneEntry : deferredEntry.second) {
-                        actorBones[boneEntry.first] = boneEntry.second;
-                    }
-                }
-            }
+            SKSE::log::info("MoveBone: {} originalY={:.3f} offset={:.3f} newY={:.3f}", nodeName.c_str(), 0.0f, yOffset,
+                            newPos.y);
 
-            return {restored, processedActors};
-        }
+            node->local.translate = newPos;
 
-        bool QueueRestoreScaledBones(std::vector<std::uint32_t> handles, std::size_t requestedCount) {
-            bool hasTargets = false;
-            {
-                std::lock_guard<std::mutex> lock(s_scaledMutex);
-                if (handles.empty()) {
-                    hasTargets = !s_scaledBones.empty();
-                } else {
-                    for (const auto handle : handles) {
-                        if (s_scaledBones.find(handle) != s_scaledBones.end()) {
-                            hasTargets = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (!hasTargets) {
-                SKSE::log::info("Async scaled bone restore skipped (requested actors={}, no tracked bones).",
-                                requestedCount);
-                PrintToConsole("ResetScaledBones: no scaled bones to restore.");
-                return false;
-            }
-
-            auto* task = SKSE::GetTaskInterface();
-            if (!task) {
-                SKSE::log::critical("Task interface unavailable; cannot queue scaled bone restore.");
-                PrintToConsole("ResetScaledBones: task interface unavailable.");
-                return false;
-            }
-
-            task->AddUITask([handles = std::move(handles), requestedCount]() mutable {
-                const auto [restoredBones, actorCount] = RestoreScaledBones(handles);
-                SKSE::log::info(
-                    "Async scaled bone restore complete (requested actors={}, restored actors={}, restored bones={})",
-                    requestedCount, actorCount, restoredBones);
-
-                if (restoredBones == 0) {
-                    PrintToConsole("ResetScaledBones: no scaled bones to restore.");
-                } else {
-                    PrintToConsole(fmt::format("ResetScaledBones: restored {} bone(s) for {} actor(s).", restoredBones,
-                                               actorCount));
-                }
-            });
-
-            return true;
-        }
-
-        void RestoreAllScaledBonesBeforeLoad() {
-            const auto [restoredBones, actorCount] = RestoreScaledBones({});
-            if (restoredBones > 0) {
-                SKSE::log::info("Pre-load restoration restored {} bone(s) for {} actor(s).", restoredBones, actorCount);
-            } else {
-                SKSE::log::debug("Pre-load restoration found no scaled bones to restore.");
-            }
-
-            std::lock_guard<std::mutex> lock(s_scaledMutex);
-            if (!s_scaledBones.empty()) {
-                const char* entryLabel = s_scaledBones.size() == 1 ? "entry" : "entries";
-                SKSE::log::debug("Clearing {} deferred scaled bone {} before save load.", s_scaledBones.size(),
-                                 entryLabel);
-                s_scaledBones.clear();
-            }
+            UpdateNodeWorldData(node);
         }
 
         bool AddMonitor(RE::Actor* probeActor, const std::vector<RE::BSFixedString>& probeNodeNames,
-                        RE::Actor* targetActor, const RE::BSFixedString& targetNodeName, float lifetimeSeconds,
-                        float distanceThreshold) {
+                        RE::Actor* targetActor, const RE::BSFixedString& targetNodeName, float distanceThreshold,
+                        float restoreThreshold) {
             if (!probeActor || !targetActor) {
                 SKSE::log::warn("AddMonitor rejected null actors (probe={}, target={})",
                                 static_cast<const void*>(probeActor), static_cast<const void*>(targetActor));
@@ -372,14 +300,11 @@ namespace {
                 return false;
             }
 
-            const auto now = std::chrono::steady_clock::now();
-            const float clampedLifetime = lifetimeSeconds > 0.0f ? lifetimeSeconds : 0.0f;
-            const auto expiration = clampedLifetime > 0.0f
-                                        ? now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                    std::chrono::duration<float>{clampedLifetime})
-                                        : std::chrono::steady_clock::time_point{};
-            // Don't clamp threshold - allow negative values for pre-emptive scaling
+            // const auto now = std::chrono::steady_clock::now(); // not used - remove
+            // Monitors created by AddMonitor run indefinitely until stopped.
+            // Don't clamp thresholds - allow negative values for pre-emptive scaling
             const float threshold = distanceThreshold;
+            const float restoreThresh = restoreThreshold;
             const auto probeHandle = probeActor->GetHandle().native_handle();
             const auto targetHandle = targetActor->GetHandle().native_handle();
 
@@ -396,11 +321,16 @@ namespace {
                     if (entry.probeHandle == probeHandle && entry.targetHandle == targetHandle &&
                         entry.targetNode == targetNodeName) {
                         entry.probeNodes = probeNodeNames;
-                        entry.expirationTime = expiration;
-                        entry.lifetimeSeconds = clampedLifetime;
+                        // no expiration for this monitor
                         entry.distanceThreshold = threshold;
-                        entry.scaledFlags.resize(entry.probeNodes.size(), false);
+                        entry.restoreThreshold = restoreThresh;
+                        entry.movedFlags.resize(entry.probeNodes.size(), false);
                         entry.waitingForBones = false;
+                        entry.cachedBaseNode.reset();
+                        entry.cachedTipNode.reset();
+                        entry.cachedMiddleBones.clear();
+                        entry.maxPenetration = 0.0f;
+                        entry.maxPenetrationBeyondThreshold = 0.0f;
                         updated = true;
                         break;
                     }
@@ -412,11 +342,14 @@ namespace {
                     newEntry.targetHandle = targetHandle;
                     newEntry.probeNodes = probeNodeNames;
                     newEntry.targetNode = targetNodeName;
-                    newEntry.expirationTime = expiration;
-                    newEntry.lifetimeSeconds = clampedLifetime;
+                    // monitor is indefinite; no expiration stored
                     newEntry.distanceThreshold = threshold;
-                    newEntry.scaledFlags.resize(probeNodeNames.size(), false);
+                    newEntry.restoreThreshold = restoreThresh;
+                    newEntry.movedFlags.resize(probeNodeNames.size(), false);
                     newEntry.waitingForBones = false;
+                    newEntry.cachedMiddleBones.resize(probeNodeNames.size());
+                    newEntry.maxPenetration = 0.0f;
+                    newEntry.maxPenetrationBeyondThreshold = 0.0f;
                     s_monitors.push_back(std::move(newEntry));
                 }
             }
@@ -425,12 +358,13 @@ namespace {
             const std::string targetName = GetActorName(targetActor);
             const auto nodeTarget = GetNodeLabel(targetNodeName);
             const std::string nodeList = JoinNodeLabels(probeNodeNames);
-            const std::string lifetimeText =
-                clampedLifetime > 0.0f ? fmt::format("{:.2f}s", clampedLifetime) : std::string{"indefinite"};
+            const std::string lifetimeText = std::string{"indefinite"};
             const std::string thresholdText = fmt::format("{:.2f}", threshold);
-            SKSE::log::info("{} bone monitor for {}.[{}] -> {}.{} (threshold {}, lifetime {})",
-                            updated ? "Updated" : "Created", probeName, nodeList, targetName, nodeTarget, thresholdText,
-                            lifetimeText);
+            const std::string restoreThresholdText = fmt::format("{:.2f}", restoreThresh);
+            SKSE::log::info(
+                "{} bone monitor for {}.[{}] -> {}.{} (shrink threshold {}, restore threshold {}, lifetime {})",
+                updated ? "Updated" : "Created", probeName, nodeList, targetName, nodeTarget, thresholdText,
+                restoreThresholdText, lifetimeText);
 
             QueueTick();
             return true;
@@ -443,10 +377,23 @@ namespace {
             {
                 std::lock_guard<std::mutex> lock(s_monitorMutex);
                 if (handles.empty()) {
+                    // Restore all bones before clearing all monitors
+                    for (auto& entry : s_monitors) {
+                        RestoreMiddleBonesForEntry(entry);
+                    }
                     removed = s_monitors.size();
                     s_monitors.clear();
                 } else {
                     const auto before = s_monitors.size();
+                    // Restore bones for monitors being removed
+                    for (auto& entry : s_monitors) {
+                        bool shouldRemove =
+                            std::find(handles.begin(), handles.end(), entry.probeHandle) != handles.end() ||
+                            std::find(handles.begin(), handles.end(), entry.targetHandle) != handles.end();
+                        if (shouldRemove) {
+                            RestoreMiddleBonesForEntry(entry);
+                        }
+                    }
                     s_monitors.erase(std::remove_if(s_monitors.begin(), s_monitors.end(),
                                                     [&](const MonitorEntry& entry) {
                                                         return std::find(handles.begin(), handles.end(),
@@ -474,43 +421,40 @@ namespace {
             // Stop all monitoring
             StopAllMonitoring();
 
-            // Clear all monitors
+            // Restore all bones and clear monitors
             {
                 std::lock_guard<std::mutex> lock(s_monitorMutex);
                 const auto count = s_monitors.size();
+
+                // Restore all moved bones to their original positions
+                for (auto& entry : s_monitors) {
+                    RestoreMiddleBonesForEntry(entry);
+                }
+
                 s_monitors.clear();
                 if (count > 0) {
                     SKSE::log::info("Cleared {} monitor(s)", count);
                 }
             }
 
-            // Restore all scaled bones
-            RestoreAllScaledBonesBeforeLoad();
-
             SKSE::log::info("Monitoring system shutdown complete.");
         }
 
         void ProcessTick() {
-            const auto now = std::chrono::steady_clock::now();
+            // Work with monitors directly instead of copying to avoid corrupting NiPoint3 data
+            std::lock_guard<std::mutex> lock(s_monitorMutex);
 
-            // Copy monitors to process without holding the lock for the entire operation
-            std::vector<MonitorEntry> monitorsToProcess;
-            {
-                std::lock_guard<std::mutex> lock(s_monitorMutex);
-                monitorsToProcess = s_monitors;
-            }
-
-            if (monitorsToProcess.empty()) {
+            if (s_monitors.empty()) {
                 std::lock_guard<std::mutex> lk(s_uiTickMutex);
                 s_uiTickActive = false;
                 return;
             }
 
-            // Track which monitors to remove and which to keep
+            // Track which monitors to remove
             std::vector<std::size_t> monitorsToRemove;
 
-            for (std::size_t monitorIdx = 0; monitorIdx < monitorsToProcess.size(); ++monitorIdx) {
-                auto& entry = monitorsToProcess[monitorIdx];
+            for (std::size_t monitorIdx = 0; monitorIdx < s_monitors.size(); ++monitorIdx) {
+                auto& entry = s_monitors[monitorIdx];
 
                 if (entry.probeNodes.empty()) {
                     SKSE::log::warn("Removing monitor with no probe nodes (probeHandle={:#x} targetHandle={:#x})",
@@ -519,14 +463,11 @@ namespace {
                     continue;
                 }
 
-                RE::NiPointer<RE::Actor> probeActor;
-                const bool probeValid =
-                    RE::Actor::LookupByHandle(static_cast<RE::RefHandle>(entry.probeHandle), probeActor) && probeActor;
+                RE::NiPointer<RE::Actor> probeActor = LookupActorByHandle(entry.probeHandle);
+                const bool probeValid = static_cast<bool>(probeActor);
 
-                RE::NiPointer<RE::Actor> targetActor;
-                const bool targetValid =
-                    RE::Actor::LookupByHandle(static_cast<RE::RefHandle>(entry.targetHandle), targetActor) &&
-                    targetActor;
+                RE::NiPointer<RE::Actor> targetActor = LookupActorByHandle(entry.targetHandle);
+                const bool targetValid = static_cast<bool>(targetActor);
 
                 if (!probeValid || !targetValid) {
                     SKSE::log::info("Removing monitor (missing actor) probeHandle={:#x} targetHandle={:#x}",
@@ -535,33 +476,50 @@ namespace {
                     continue;
                 }
 
-                // Check expiration
-                if (entry.expirationTime.time_since_epoch().count() != 0 && now >= entry.expirationTime) {
-                    SKSE::log::info("Removing monitor (expired) probeHandle={:#x} targetHandle={:#x} after {:.2f}s",
-                                    entry.probeHandle, entry.targetHandle, entry.lifetimeSeconds);
-                    monitorsToRemove.push_back(monitorIdx);
-                    continue;
-                }
+                // monitors are indefinite; expiration check removed
 
-                entry.scaledFlags.resize(entry.probeNodes.size(), false);
+                entry.movedFlags.resize(entry.probeNodes.size(), false);
+                entry.cachedMiddleBones.resize(entry.probeNodes.size());
 
                 auto* targetNode = targetActor->GetNodeByName(entry.targetNode);
-                std::vector<RE::NiAVObject*> probeNodePtrs(entry.probeNodes.size(), nullptr);
-                bool missingBones = false;
 
-                for (std::size_t idx = 0; idx < entry.probeNodes.size(); ++idx) {
-                    probeNodePtrs[idx] = probeActor->GetNodeByName(entry.probeNodes[idx]);
-                    if (!probeNodePtrs[idx]) {
-                        missingBones = true;
-                        break;
+                // Get base (first) and tip (last) bones for direction/distance calculation
+                if (!entry.cachedBaseNode) {
+                    entry.cachedBaseNode =
+                        RE::NiPointer<RE::NiAVObject>(probeActor->GetNodeByName(entry.probeNodes[0]));
+                }
+                if (!entry.cachedTipNode) {
+                    entry.cachedTipNode = RE::NiPointer<RE::NiAVObject>(
+                        probeActor->GetNodeByName(entry.probeNodes[entry.probeNodes.size() - 1]));
+                }
+                auto* baseNode = entry.cachedBaseNode.get();
+                auto* tipNode = entry.cachedTipNode.get();
+
+                // Get middle bones that will actually be moved
+                std::vector<RE::NiAVObject*> middleBones;
+                std::vector<std::size_t> middleBoneIndices;
+                for (std::size_t idx = 1; idx < entry.probeNodes.size() - 1; ++idx) {
+                    auto& cachedBone = entry.cachedMiddleBones[idx];
+                    if (!cachedBone) {
+                        cachedBone = RE::NiPointer<RE::NiAVObject>(probeActor->GetNodeByName(entry.probeNodes[idx]));
+                    }
+                    auto* bone = cachedBone.get();
+                    if (bone) {
+                        middleBones.push_back(bone);
+                        middleBoneIndices.push_back(idx);
+                    } else {
+                        cachedBone.reset();
                     }
                 }
 
-                if (!targetNode || missingBones) {
+                if (!targetNode || !baseNode || !tipNode || middleBones.empty()) {
                     if (!entry.waitingForBones) {
                         entry.waitingForBones = true;
-                        SKSE::log::info("Waiting for bones (probeHandle={:#x} targetHandle={:#x})", entry.probeHandle,
-                                        entry.targetHandle);
+                        SKSE::log::info(
+                            "Waiting for bones (probeHandle={:#x} targetHandle={:#x} target={} base={} tip={} "
+                            "middle={})",
+                            entry.probeHandle, entry.targetHandle, targetNode ? "ok" : "missing",
+                            baseNode ? "ok" : "missing", tipNode ? "ok" : "missing", middleBones.size());
                     }
                     continue;
                 }
@@ -572,144 +530,117 @@ namespace {
                                     entry.targetHandle);
                 }
 
-                // Calculate directional penetration depths for all probe nodes
-                // Use probe bone chain to determine forward direction
-                std::vector<float> penetrationDepths(entry.probeNodes.size(), -std::numeric_limits<float>::max());
-                bool hadInvalidNodes = false;
+                // Calculate probe chain direction vector (base -> tip) using CURRENT positions
+                // Use original local positions only for restoring; penetration should reflect live pose
+                const auto& targetPos = targetNode->world.translate;
+                const auto& baseWorld = baseNode->world.translate;
+                const auto& tipWorld = tipNode->world.translate;
 
-                // Need at least 2 probe nodes to determine direction
-                if (probeNodePtrs.size() < 2) {
-                    SKSE::log::warn("Need at least 2 probe nodes for directional detection (probeHandle={:#x})",
-                                    entry.probeHandle);
+                // Calculate direction vector (normalized) from current positions
+                RE::NiPoint3 probeDirection = tipWorld - baseWorld;
+                const float probeLength = probeDirection.Length();
+
+                if (probeLength < 0.001f) {
+                    // Probe bones are too close together, can't determine direction
+                    SKSE::log::debug("Probe bones too close together (probeHandle={:#x})", entry.probeHandle);
                     continue;
                 }
 
-                // Calculate probe chain direction vector (base -> tip)
-                auto* baseNode = probeNodePtrs[0];
-                auto* tipNode = probeNodePtrs[probeNodePtrs.size() - 1];
+                probeDirection = probeDirection / probeLength;  // Normalize
 
-                if (!baseNode || !tipNode || !targetNode) {
-                    hadInvalidNodes = true;
-                }
+                // Calculate penetration depth for tip bone only
+                // Vector from target to tip (using CURRENT tip position)
+                RE::NiPoint3 targetToTip = tipWorld - targetPos;
 
-                if (!hadInvalidNodes) {
-                    // Get probe direction from first to last bone
-                    const auto& basePos = baseNode->world.translate;
-                    const auto& tipPos = tipNode->world.translate;
-                    const auto& targetPos = targetNode->world.translate;
+                // Project onto probe direction to get penetration depth
+                // Positive = probe has gone beyond target in forward direction
+                // Negative = probe hasn't reached target yet
+                float tipPenetration = targetToTip.Dot(probeDirection);
 
-                    // Calculate direction vector (normalized)
-                    RE::NiPoint3 probeDirection = tipPos - basePos;
-                    const float probeLength = probeDirection.Length();
+                SKSE::log::info(
+                    "Penetration check: probeHandle={:#x} tipPenetration={:.3f} shrinkThreshold={:.3f} "
+                    "restoreThreshold={:.3f}",
+                    entry.probeHandle, tipPenetration, entry.distanceThreshold, entry.restoreThreshold);
 
-                    if (probeLength < 0.001f) {
-                        // Probe bones are too close together, can't determine direction
-                        SKSE::log::debug("Probe bones too close together (probeHandle={:#x})", entry.probeHandle);
-                        continue;
+                if (tipPenetration > entry.distanceThreshold) {
+                    // Track max for telemetry, but drive offset from cached maximum beyond threshold
+                    if (tipPenetration > entry.maxPenetration) {
+                        entry.maxPenetration = tipPenetration;
+                        SKSE::log::debug("New max penetration: {:.3f} (probeHandle={:#x})", entry.maxPenetration,
+                                         entry.probeHandle);
                     }
 
-                    probeDirection = probeDirection / probeLength;  // Normalize
-
-                    // For each probe node, calculate how far it has penetrated beyond the target
-                    // along the probe's forward direction
-                    for (std::size_t idx = 0; idx < entry.probeNodes.size(); ++idx) {
-                        auto* probeNode = probeNodePtrs[idx];
-                        if (!probeNode) {
-                            hadInvalidNodes = true;
-                            continue;
-                        }
-
-                        // Vector from target to this probe node
-                        RE::NiPoint3 targetToProbe = probeNode->world.translate - targetPos;
-
-                        // Project onto probe direction to get penetration depth
-                        // Positive = probe has gone beyond target in forward direction
-                        // Negative = probe hasn't reached target yet
-                        penetrationDepths[idx] = targetToProbe.Dot(probeDirection);
-
-                        // Debug logging: show penetration for each node
-                        SKSE::log::debug(
-                            "Penetration check: probeHandle={:#x} node[{}]={} penetration={:.3f} threshold={:.3f}",
-                            entry.probeHandle, idx, GetNodeLabel(entry.probeNodes[idx]), penetrationDepths[idx],
-                            entry.distanceThreshold);
+                    const float currentBeyondThreshold = tipPenetration - entry.distanceThreshold;
+                    bool newMaxBeyond = false;
+                    if (currentBeyondThreshold > entry.maxPenetrationBeyondThreshold) {
+                        entry.maxPenetrationBeyondThreshold = currentBeyondThreshold;
+                        newMaxBeyond = true;
+                        SKSE::log::debug("New max penetration beyond threshold: {:.3f} (probeHandle={:#x})",
+                                         entry.maxPenetrationBeyondThreshold, entry.probeHandle);
                     }
-                }
 
-                // If nodes became invalid during processing, skip scaling this frame
-                if (hadInvalidNodes) {
-                    SKSE::log::debug("Skipping frame for probeHandle={:#x} (invalid nodes)", entry.probeHandle);
-                    continue;
-                }
+                    // Use cached maximum penetration beyond threshold for offset calculation
+                    float penetrationBeyondThreshold = entry.maxPenetrationBeyondThreshold;
 
-                // Find the first node that has penetrated beyond threshold
-                // Scale it and all subsequent nodes (cascade effect)
-                int firstPenetratedIndex = -1;
-                float maxPenetration = -std::numeric_limits<float>::max();
+                    // Distribute offset evenly across all middle bones
+                    float distributedOffset = penetrationBeyondThreshold / static_cast<float>(middleBones.size());
 
-                // Check all nodes for threshold breach (works for positive, zero, or negative thresholds)
-                for (std::size_t idx = 0; idx < penetrationDepths.size(); ++idx) {
-                    // Check if this node has penetrated beyond the threshold
-                    if (penetrationDepths[idx] > entry.distanceThreshold) {
-                        if (firstPenetratedIndex == -1) {
-                            firstPenetratedIndex = static_cast<int>(idx);
-                        }
-                        if (penetrationDepths[idx] > maxPenetration) {
-                            maxPenetration = penetrationDepths[idx];
-                        }
-                    }
-                }
+                    // Clamp offset to prevent runaway feedback loop
+                    distributedOffset = std::min(distributedOffset, kMaxBoneOffset);
 
-                // Scale bones if penetration threshold breached
-                if (firstPenetratedIndex != -1) {
-                    // Scale from the first penetrated node onwards (cascade to tail)
-                    for (std::size_t idx = static_cast<std::size_t>(firstPenetratedIndex); idx < probeNodePtrs.size();
-                         ++idx) {
-                        auto* node = probeNodePtrs[idx];
-                        if (!node) {
-                            continue;
+                    // Only update bones when we achieved a new max OR they have been restored to original length
+                    for (std::size_t i = 0; i < middleBones.size(); ++i) {
+                        const std::size_t boneIdx = middleBoneIndices[i];
+                        const bool wasMoved = entry.movedFlags[boneIdx];
+
+                        if (!newMaxBeyond && wasMoved) {
+                            continue;  // already at max
                         }
 
-                        const bool wasScaled = entry.scaledFlags[idx];
-                        ScaleBoneToTarget(entry.probeHandle, node, entry.probeNodes[idx]);
-                        entry.scaledFlags[idx] = true;
+                        MoveBoneToTarget(probeActor.get(), entry.probeNodes[boneIdx], distributedOffset);
+                        entry.movedFlags[boneIdx] = true;
 
-                        if (!wasScaled) {
+                        if (!wasMoved) {
                             SKSE::log::info(
-                                "Scaled bone (probeHandle={:#x} node={} penetration={:.2f} threshold={:.2f})",
-                                entry.probeHandle, GetNodeLabel(entry.probeNodes[idx]), penetrationDepths[idx],
-                                entry.distanceThreshold);
+                                "Moved bone (probeHandle={:#x} node={} distributedOffset={:.2f} tipPenetration={:.2f} "
+                                "maxPenetration={:.2f} threshold={:.2f})",
+                                entry.probeHandle, GetNodeLabel(entry.probeNodes[boneIdx]), distributedOffset,
+                                tipPenetration, entry.maxPenetration, entry.distanceThreshold);
                         }
                     }
+                } else if (tipPenetration <= entry.restoreThreshold) {
+                    // Tip is at or below restore threshold - restore all moved middle bones to original positions
+                    for (std::size_t i = 0; i < middleBones.size(); ++i) {
+                        const std::size_t boneIdx = middleBoneIndices[i];
+                        if (entry.movedFlags[boneIdx]) {
+                            RestoreBonePosition(probeActor.get(), entry.probeNodes[boneIdx]);
+                            entry.movedFlags[boneIdx] = false;
+                            SKSE::log::info(
+                                "Restored bone (probeHandle={:#x} node={} tipPenetration={:.2f} "
+                                "restoreThreshold={:.2f})",
+                                entry.probeHandle, GetNodeLabel(entry.probeNodes[boneIdx]), tipPenetration,
+                                entry.restoreThreshold);
+                        }
+                    }
+                    // Keep maxPenetration - it represents the learned maximum for this looped animation
+                    // Only reset when monitor is removed/recreated
+                }
+                // else: tipPenetration is between restoreThreshold and distanceThreshold - maintain current state
+            }
+
+            // Remove monitors in reverse order to maintain indices
+            for (auto it = monitorsToRemove.rbegin(); it != monitorsToRemove.rend(); ++it) {
+                if (*it < s_monitors.size()) {
+                    s_monitors.erase(s_monitors.begin() + *it);
                 }
             }
 
-            // Update original monitors and remove expired/invalid ones
-            {
-                std::lock_guard<std::mutex> lock(s_monitorMutex);
-
-                // Remove monitors in reverse order to maintain indices
-                for (auto it = monitorsToRemove.rbegin(); it != monitorsToRemove.rend(); ++it) {
-                    if (*it < s_monitors.size()) {
-                        s_monitors.erase(s_monitors.begin() + *it);
-                    }
-                }
-
-                // Update scaled flags for remaining monitors
-                for (std::size_t i = 0; i < s_monitors.size() && i < monitorsToProcess.size(); ++i) {
-                    if (s_monitors[i].probeHandle == monitorsToProcess[i].probeHandle &&
-                        s_monitors[i].targetHandle == monitorsToProcess[i].targetHandle) {
-                        s_monitors[i].scaledFlags = monitorsToProcess[i].scaledFlags;
-                        s_monitors[i].waitingForBones = monitorsToProcess[i].waitingForBones;
-                    }
-                }
-
-                // Check if we still have active monitors
-                if (s_monitors.empty()) {
-                    std::lock_guard<std::mutex> lk(s_uiTickMutex);
-                    s_uiTickActive = false;
-                    SKSE::log::info("No more active monitors, stopping tick.");
-                    return;
-                }
+            // Check if we still have active monitors
+            if (s_monitors.empty()) {
+                std::lock_guard<std::mutex> lk(s_uiTickMutex);
+                s_uiTickActive = false;
+                SKSE::log::info("No more active monitors, stopping tick.");
+                return;
             }
 
             // Schedule next tick
@@ -721,12 +652,12 @@ namespace {
 namespace Papyrus {
     bool RegisterBoneMonitor(RE::StaticFunctionTag*, RE::Actor* probeActor,
                              RE::reference_array<RE::BSFixedString> probeNodeNames, RE::Actor* targetActor,
-                             RE::BSFixedString targetNodeName, float duration, float distanceThreshold) {
+                             RE::BSFixedString targetNodeName, float distanceThreshold, float restoreThreshold) {
         SKSE::log::info(
-            "RegisterBoneMonitor invoked (probeActor={}, targetActor={}, duration={:.2f}, threshold={:.2f}, "
-            "probeNodes={})",
-            static_cast<const void*>(probeActor), static_cast<const void*>(targetActor), duration, distanceThreshold,
-            probeNodeNames.size());
+            "RegisterBoneMonitor invoked (probeActor={}, targetActor={}, shrinkThreshold={:.2f}, "
+            "restoreThreshold={:.2f}, probeNodes={})",
+            static_cast<const void*>(probeActor), static_cast<const void*>(targetActor), distanceThreshold,
+            restoreThreshold, probeNodeNames.size());
 
         if (!probeActor || !targetActor) {
             PrintToConsole("RegisterBoneMonitor: invalid actor arguments.");
@@ -749,26 +680,32 @@ namespace Papyrus {
             probeNodes.push_back(name);
         }
 
+        // Require at least base, middle, and tip bones
+        if (probeNodes.size() < 3) {
+            PrintToConsole("RegisterBoneMonitor: probe node list must contain at least 3 nodes (base, middle, tip).");
+            return false;
+        }
+
         const char* targetNodeData = targetNodeName.data();
         if (!targetNodeData || *targetNodeData == '\0') {
             PrintToConsole("RegisterBoneMonitor: target node name must be non-empty.");
             return false;
         }
 
-        const float lifetimeSeconds = duration > 0.0f ? duration : 0.0f;
-        if (!Monitoring::AddMonitor(probeActor, probeNodes, targetActor, targetNodeName, lifetimeSeconds,
-                                    distanceThreshold)) {
+        if (!Monitoring::AddMonitor(probeActor, probeNodes, targetActor, targetNodeName, distanceThreshold,
+                                    restoreThreshold)) {
             PrintToConsole("RegisterBoneMonitor: failed to start monitoring.");
             return false;
         }
 
-        const std::string lifetimeText =
-            lifetimeSeconds > 0.0f ? fmt::format("{:.2f}s", lifetimeSeconds) : std::string{"until stopped"};
-        const std::string thresholdText = fmt::format("{:.2f}", distanceThreshold);
+        const std::string lifetimeText = std::string{"until stopped"};
+        const std::string shrinkThresholdText = fmt::format("{:.2f}", distanceThreshold);
+        const std::string restoreThresholdText = fmt::format("{:.2f}", restoreThreshold);
         const std::string probeNodeList = JoinNodeLabels(probeNodes);
-        PrintToConsole(fmt::format("RegisterBoneMonitor: monitoring {}.[{}] -> {}.{} (threshold {}, lifetime {})",
-                                   GetActorName(probeActor), probeNodeList, GetActorName(targetActor),
-                                   GetNodeLabel(targetNodeName), thresholdText, lifetimeText));
+        PrintToConsole(
+            fmt::format("RegisterBoneMonitor: monitoring {}.[{}] -> {}.{} (shrink {}, restore {}, lifetime {})",
+                        GetActorName(probeActor), probeNodeList, GetActorName(targetActor),
+                        GetNodeLabel(targetNodeName), shrinkThresholdText, restoreThresholdText, lifetimeText));
         return true;
     }
 
@@ -776,8 +713,8 @@ namespace Papyrus {
         std::vector<std::uint32_t> handles;
         handles.reserve(actors.size());
 
-        for (std::uint32_t i = 0; i < actors.size(); ++i) {
-            if (auto* actor = actors[i]) {
+        for (const auto& actor : actors) {
+            if (actor) {
                 const auto handle = actor->GetHandle().native_handle();
                 if (handle != 0) {
                     handles.push_back(handle);
@@ -807,34 +744,23 @@ namespace Papyrus {
         return true;
     }
 
-    bool ResetScaledBones(RE::StaticFunctionTag*, RE::reference_array<RE::Actor*> actors) {
-        std::vector<std::uint32_t> handles;
-        handles.reserve(actors.size());
+    void SetTickInterval(RE::StaticFunctionTag*, int intervalMs) {
+        SKSE::log::info("SetTickInterval invoked (intervalMs={})", intervalMs);
+        Monitoring::SetTickInterval(intervalMs);
+        PrintToConsole(fmt::format("SetTickInterval: interval set to {}ms", Monitoring::GetTickInterval()));
+    }
 
-        for (std::uint32_t i = 0; i < actors.size(); ++i) {
-            if (auto* actor = actors[i]) {
-                const auto handle = actor->GetHandle().native_handle();
-                if (handle != 0) {
-                    handles.push_back(handle);
-                }
-            }
-        }
-
-        const std::size_t requestedActors = handles.size();
-        if (!Monitoring::QueueRestoreScaledBones(std::move(handles), requestedActors)) {
-            SKSE::log::warn("ResetScaledBones invoked but restore task was not queued (requested actors={}).",
-                            requestedActors);
-            return false;
-        }
-
-        SKSE::log::info("ResetScaledBones invoked (requested actors={}, task queued)", requestedActors);
-        return true;
+    int GetTickInterval(RE::StaticFunctionTag*) {
+        const int interval = Monitoring::GetTickInterval();
+        SKSE::log::info("GetTickInterval invoked, returning {}ms", interval);
+        return interval;
     }
 
     bool RegisterFunctions(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("RegisterBoneMonitor"sv, "KnowYourLimits"sv, RegisterBoneMonitor);
         vm->RegisterFunction("StopBoneMonitor"sv, "KnowYourLimits"sv, StopBoneMonitor);
-        vm->RegisterFunction("ResetScaledBones"sv, "KnowYourLimits"sv, ResetScaledBones);
+        vm->RegisterFunction("SetTickInterval"sv, "KnowYourLimits"sv, SetTickInterval);
+        vm->RegisterFunction("GetTickInterval"sv, "KnowYourLimits"sv, GetTickInterval);
         SKSE::log::info("Papyrus functions registered.");
         return true;
     }
@@ -846,18 +772,15 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SetupLogging();
     SKSE::log::info("Know Your Limits plugin loading...");
 
+    // Note: monitoring code obtains the task interface lazily with SKSE::GetTaskInterface().
+
     if (const auto* messaging = SKSE::GetMessagingInterface()) {
         if (!messaging->RegisterListener([](SKSE::MessagingInterface::Message* message) {
                 switch (message->type) {
-                    case SKSE::MessagingInterface::kPreLoadGame:
-                        SKSE::log::info("PreLoadGame: restoring scaled bones before loading save.");
-                        Monitoring::RestoreAllScaledBonesBeforeLoad();
-                        break;
-
                     case SKSE::MessagingInterface::kPostLoadGame:
                     case SKSE::MessagingInterface::kNewGame:
-                        SKSE::log::info("New game/Load: cleaning up monitoring system.");
-                        Monitoring::StopAllMonitoring();
+                        SKSE::log::info("New game/Load: cleaning up monitoring system and restoring bones.");
+                        Monitoring::Shutdown();
                         break;
 
                     case SKSE::MessagingInterface::kDataLoaded:

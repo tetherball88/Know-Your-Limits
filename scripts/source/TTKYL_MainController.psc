@@ -2,6 +2,8 @@ Scriptname TTKYL_MainController extends Quest
 
 Actor Property PlayerRef  Auto  
 
+SexLabFramework Property SexLab Auto
+
 Int Function GetVersion()
     return 1
 EndFunction
@@ -11,8 +13,18 @@ Event OnInit()
 EndEvent
 
 Function Maintenance()
+    ; Apply interval from configuration
+    TTKYL_Utils.ApplyIntervalFromConfig()
+
+    
+    
     if Game.GetModByName("OStim.esp") != 255
         OstimSetup()
+    EndIf
+
+    if Game.GetModByName("SexLab.esm") != 255
+        SexLab = Game.GetFormFromFile(0xD62, "SexLab.esm") as SexLabFramework
+        SexlabSetup()
     EndIf
 EndFunction
 
@@ -34,8 +46,26 @@ Function OStimSceneChanged(string EventName, string StrArg, float ThreadID, Form
     TTKYL_OStim.OnChange(EventName, StrArg, ThreadID, Sender)
 EndFunction
 
+Function SexlabSetup()
+    RegisterForModEvent("HookAnimationStart", "SexlabHookStart")
+    RegisterForModEvent("HookStageStart", "SexlabHookStageStart")
+    RegisterForModEvent("HookStageEnd", "SexlabHookStageEnd")
+    RegisterForModEvent("HookAnimationEnd", "SexlabHookEnd")
+EndFunction
 
+Function SexlabHookStart(int ThreadID, bool HasPlayer)
+    TKYL_Sexlab.OnHookStart(SexLab, ThreadID, HasPlayer)
+EndFunction
 
+Function SexlabHookStageStart(int ThreadID, bool HasPlayer)
+    TKYL_Sexlab.OnHookStageStart(SexLab, ThreadID, HasPlayer)
+EndFunction
 
+Function SexlabHookStageEnd(int ThreadID, bool HasPlayer)
+    TKYL_Sexlab.OnHookStageEnd(SexLab, ThreadID, HasPlayer)
+EndFunction
 
+Function SexlabHookEnd(int ThreadID, bool HasPlayer)
+    TKYL_Sexlab.OnHookEnd(SexLab, ThreadID, HasPlayer)
+EndFunction
 
