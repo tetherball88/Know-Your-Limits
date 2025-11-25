@@ -2,6 +2,7 @@
 .idea
 .vs
 .vscode
+.claude/
 
 # Build outputs (except final DLL)
 build/

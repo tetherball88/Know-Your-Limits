@@ -3,17 +3,19 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <unordered_map>  // third-party libs may include this, but not used directly in this file
 #include <utility>
 #include <vector>
 
@@ -59,7 +61,7 @@ namespace {
 
     std::string GetActorName(RE::Actor* actor) {
         if (!actor) {
-            return std::string{"<none>"};
+            return "<none>";
         }
 
         if (const char* name = actor->GetDisplayFullName(); name && *name != '\0') {
@@ -70,7 +72,7 @@ namespace {
             return baseName;
         }
 
-        return std::string{"<unnamed>"};
+        return "<unnamed>";
     }
 
     std::string_view GetNodeLabel(const RE::BSFixedString& nodeName) {
@@ -122,11 +124,16 @@ namespace {
         std::vector<MonitorEntry> s_monitors;
 
         std::mutex s_uiTickMutex;
-        bool s_uiTickActive = false;
+        std::atomic<bool> s_uiTickActive{false};
         std::chrono::steady_clock::time_point s_lastTickTime{};
 
         // Configurable tick interval - can be set from Papyrus, defaults to 50ms
-        std::chrono::milliseconds s_tickInterval{50};
+        std::atomic<int> s_tickIntervalMs{50};
+
+        // Shutdown synchronization for background thread
+        std::atomic<bool> s_shutdownRequested{false};
+        std::condition_variable s_shutdownCV;
+        std::mutex s_shutdownMutex;
 
         // Run the monitor tick at most 4 times per second to avoid UI thread churn.
         constexpr float kPositionTolerance = 0.1f;  // Tolerance for position comparisons
@@ -135,26 +142,30 @@ namespace {
         void ProcessTick();
 
         void SetTickInterval(int intervalMs) {
-            std::lock_guard<std::mutex> lk(s_uiTickMutex);
             // Clamp interval to reasonable bounds (16ms to 1000ms)
-            int clampedInterval = std::max(16, std::min(1000, intervalMs));
-            s_tickInterval = std::chrono::milliseconds{clampedInterval};
+            const int clampedInterval = std::clamp(intervalMs, 16, 1000);
+            s_tickIntervalMs.store(clampedInterval, std::memory_order_relaxed);
             SKSE::log::info("Tick interval set to {}ms", clampedInterval);
         }
 
         int GetTickInterval() {
-            std::lock_guard<std::mutex> lk(s_uiTickMutex);
-            return static_cast<int>(s_tickInterval.count());
+            return s_tickIntervalMs.load(std::memory_order_relaxed);
         }
 
         void QueueTick() {
+            // Use atomic for quick check without lock
+            if (s_uiTickActive.load(std::memory_order_acquire)) {
+                return;
+            }
+
             std::lock_guard<std::mutex> lk(s_uiTickMutex);
-            if (s_uiTickActive) {
+            // Double-check after acquiring lock
+            if (s_uiTickActive.load(std::memory_order_relaxed)) {
                 return;
             }
 
             if (auto* task = SKSE::GetTaskInterface()) {
-                s_uiTickActive = true;
+                s_uiTickActive.store(true, std::memory_order_release);
                 s_lastTickTime = std::chrono::steady_clock::now();
                 task->AddUITask([]() { ProcessTick(); });
             } else {
@@ -163,25 +174,41 @@ namespace {
         }
 
         void ScheduleNextTick() {
-            // Use a detached thread ONLY for the sleep, then queue the actual work on UI thread
-            // This avoids freezing the UI thread while still using SKSE's task system
-            std::thread([task = SKSE::GetTaskInterface()]() {
-                if (!task) {
-                    std::lock_guard<std::mutex> lk(s_uiTickMutex);
-                    s_uiTickActive = false;
-                    SKSE::log::critical("Task interface unavailable; stopping monitor updates.");
-                    return;
+            // Check for shutdown before scheduling
+            if (s_shutdownRequested.load(std::memory_order_acquire)) {
+                s_uiTickActive.store(false, std::memory_order_release);
+                return;
+            }
+
+            auto* task = SKSE::GetTaskInterface();
+            if (!task) {
+                s_uiTickActive.store(false, std::memory_order_release);
+                SKSE::log::critical("Task interface unavailable; stopping monitor updates.");
+                return;
+            }
+
+            // Use a detached thread for the sleep, but with shutdown awareness
+            // This thread is short-lived (just sleeps then queues) so detach is acceptable
+            std::thread([task]() {
+                const auto intervalMs = s_tickIntervalMs.load(std::memory_order_relaxed);
+                const auto interval = std::chrono::milliseconds{intervalMs};
+
+                // Use condition variable for interruptible sleep
+                {
+                    std::unique_lock<std::mutex> lk(s_shutdownMutex);
+                    if (s_shutdownCV.wait_for(lk, interval, []() {
+                            return s_shutdownRequested.load(std::memory_order_acquire);
+                        })) {
+                        // Shutdown was requested during sleep
+                        s_uiTickActive.store(false, std::memory_order_release);
+                        return;
+                    }
                 }
 
-                const auto now = std::chrono::steady_clock::now();
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastTickTime);
-
-                // Sleep on background thread to avoid blocking UI
-                if (elapsed < s_tickInterval) {
-                    std::this_thread::sleep_for(s_tickInterval - elapsed);
-                } else {
-                    // If we're behind schedule, still sleep a minimum amount
-                    std::this_thread::sleep_for(s_tickInterval);
+                // Check shutdown again after waking
+                if (s_shutdownRequested.load(std::memory_order_acquire)) {
+                    s_uiTickActive.store(false, std::memory_order_release);
+                    return;
                 }
 
                 // Queue the actual processing on UI thread
@@ -193,9 +220,17 @@ namespace {
         }
 
         void StopAllMonitoring() {
-            std::lock_guard<std::mutex> lk(s_uiTickMutex);
-            s_uiTickActive = false;
+            // Signal shutdown to any sleeping threads
+            s_shutdownRequested.store(true, std::memory_order_release);
+            s_shutdownCV.notify_all();
+
+            s_uiTickActive.store(false, std::memory_order_release);
             SKSE::log::info("Monitoring system stopped.");
+        }
+
+        void ResetShutdownState() {
+            // Called when starting fresh monitoring after a shutdown
+            s_shutdownRequested.store(false, std::memory_order_release);
         }
 
         void UpdateNodeWorldData(RE::NiAVObject* node) {
@@ -203,11 +238,8 @@ namespace {
                 return;
             }
 
-            RE::NiPointer<RE::NiAVObject> nodePtr(node);
-            if (nodePtr) {
-                RE::NiUpdateData updateData;
-                nodePtr->UpdateWorldData(&updateData);
-            }
+            RE::NiUpdateData updateData;
+            node->UpdateWorldData(&updateData);
         }
 
         void RestoreBonePosition(RE::Actor* actor, const RE::BSFixedString& nodeName) {
@@ -300,11 +332,8 @@ namespace {
                 return false;
             }
 
-            // const auto now = std::chrono::steady_clock::now(); // not used - remove
             // Monitors created by AddMonitor run indefinitely until stopped.
             // Don't clamp thresholds - allow negative values for pre-emptive scaling
-            const float threshold = distanceThreshold;
-            const float restoreThresh = restoreThreshold;
             const auto probeHandle = probeActor->GetHandle().native_handle();
             const auto targetHandle = targetActor->GetHandle().native_handle();
 
@@ -321,9 +350,8 @@ namespace {
                     if (entry.probeHandle == probeHandle && entry.targetHandle == targetHandle &&
                         entry.targetNode == targetNodeName) {
                         entry.probeNodes = probeNodeNames;
-                        // no expiration for this monitor
-                        entry.distanceThreshold = threshold;
-                        entry.restoreThreshold = restoreThresh;
+                        entry.distanceThreshold = distanceThreshold;
+                        entry.restoreThreshold = restoreThreshold;
                         entry.movedFlags.resize(entry.probeNodes.size(), false);
                         entry.waitingForBones = false;
                         entry.cachedBaseNode.reset();
@@ -342,9 +370,8 @@ namespace {
                     newEntry.targetHandle = targetHandle;
                     newEntry.probeNodes = probeNodeNames;
                     newEntry.targetNode = targetNodeName;
-                    // monitor is indefinite; no expiration stored
-                    newEntry.distanceThreshold = threshold;
-                    newEntry.restoreThreshold = restoreThresh;
+                    newEntry.distanceThreshold = distanceThreshold;
+                    newEntry.restoreThreshold = restoreThreshold;
                     newEntry.movedFlags.resize(probeNodeNames.size(), false);
                     newEntry.waitingForBones = false;
                     newEntry.cachedMiddleBones.resize(probeNodeNames.size());
@@ -354,18 +381,14 @@ namespace {
                 }
             }
 
-            const std::string probeName = GetActorName(probeActor);
-            const std::string targetName = GetActorName(targetActor);
-            const auto nodeTarget = GetNodeLabel(targetNodeName);
-            const std::string nodeList = JoinNodeLabels(probeNodeNames);
-            const std::string lifetimeText = std::string{"indefinite"};
-            const std::string thresholdText = fmt::format("{:.2f}", threshold);
-            const std::string restoreThresholdText = fmt::format("{:.2f}", restoreThresh);
             SKSE::log::info(
-                "{} bone monitor for {}.[{}] -> {}.{} (shrink threshold {}, restore threshold {}, lifetime {})",
-                updated ? "Updated" : "Created", probeName, nodeList, targetName, nodeTarget, thresholdText,
-                restoreThresholdText, lifetimeText);
+                "{} bone monitor for {}.[{}] -> {}.{} (shrink threshold {:.2f}, restore threshold {:.2f}, lifetime "
+                "indefinite)",
+                updated ? "Updated" : "Created", GetActorName(probeActor), JoinNodeLabels(probeNodeNames),
+                GetActorName(targetActor), GetNodeLabel(targetNodeName), distanceThreshold, restoreThreshold);
 
+            // Reset shutdown state in case we're starting fresh after a previous shutdown
+            ResetShutdownState();
             QueueTick();
             return true;
         }
@@ -384,24 +407,21 @@ namespace {
                     removed = s_monitors.size();
                     s_monitors.clear();
                 } else {
+                    // Use a set for O(1) lookup instead of O(n) linear search
+                    const std::set<std::uint32_t> handleSet(handles.begin(), handles.end());
+
+                    auto shouldRemove = [&handleSet](const MonitorEntry& entry) {
+                        return handleSet.contains(entry.probeHandle) || handleSet.contains(entry.targetHandle);
+                    };
+
                     const auto before = s_monitors.size();
                     // Restore bones for monitors being removed
                     for (auto& entry : s_monitors) {
-                        bool shouldRemove =
-                            std::find(handles.begin(), handles.end(), entry.probeHandle) != handles.end() ||
-                            std::find(handles.begin(), handles.end(), entry.targetHandle) != handles.end();
-                        if (shouldRemove) {
+                        if (shouldRemove(entry)) {
                             RestoreMiddleBonesForEntry(entry);
                         }
                     }
-                    s_monitors.erase(std::remove_if(s_monitors.begin(), s_monitors.end(),
-                                                    [&](const MonitorEntry& entry) {
-                                                        return std::find(handles.begin(), handles.end(),
-                                                                         entry.probeHandle) != handles.end() ||
-                                                               std::find(handles.begin(), handles.end(),
-                                                                         entry.targetHandle) != handles.end();
-                                                    }),
-                                     s_monitors.end());
+                    std::erase_if(s_monitors, shouldRemove);
                     removed = before - s_monitors.size();
                 }
 
@@ -441,12 +461,18 @@ namespace {
         }
 
         void ProcessTick() {
+            // Check for shutdown request
+            if (s_shutdownRequested.load(std::memory_order_acquire)) {
+                s_uiTickActive.store(false, std::memory_order_release);
+                return;
+            }
+
             // Work with monitors directly instead of copying to avoid corrupting NiPoint3 data
             std::lock_guard<std::mutex> lock(s_monitorMutex);
 
             if (s_monitors.empty()) {
-                std::lock_guard<std::mutex> lk(s_uiTickMutex);
-                s_uiTickActive = false;
+                // Use atomic instead of mutex to avoid potential deadlock
+                s_uiTickActive.store(false, std::memory_order_release);
                 return;
             }
 
@@ -496,8 +522,11 @@ namespace {
                 auto* tipNode = entry.cachedTipNode.get();
 
                 // Get middle bones that will actually be moved
+                const std::size_t middleCount = entry.probeNodes.size() > 2 ? entry.probeNodes.size() - 2 : 0;
                 std::vector<RE::NiAVObject*> middleBones;
                 std::vector<std::size_t> middleBoneIndices;
+                middleBones.reserve(middleCount);
+                middleBoneIndices.reserve(middleCount);
                 for (std::size_t idx = 1; idx < entry.probeNodes.size() - 1; ++idx) {
                     auto& cachedBone = entry.cachedMiddleBones[idx];
                     if (!cachedBone) {
@@ -637,8 +666,8 @@ namespace {
 
             // Check if we still have active monitors
             if (s_monitors.empty()) {
-                std::lock_guard<std::mutex> lk(s_uiTickMutex);
-                s_uiTickActive = false;
+                // Use atomic instead of mutex to avoid potential deadlock
+                s_uiTickActive.store(false, std::memory_order_release);
                 SKSE::log::info("No more active monitors, stopping tick.");
                 return;
             }
@@ -698,14 +727,10 @@ namespace Papyrus {
             return false;
         }
 
-        const std::string lifetimeText = std::string{"until stopped"};
-        const std::string shrinkThresholdText = fmt::format("{:.2f}", distanceThreshold);
-        const std::string restoreThresholdText = fmt::format("{:.2f}", restoreThreshold);
-        const std::string probeNodeList = JoinNodeLabels(probeNodes);
-        PrintToConsole(
-            fmt::format("RegisterBoneMonitor: monitoring {}.[{}] -> {}.{} (shrink {}, restore {}, lifetime {})",
-                        GetActorName(probeActor), probeNodeList, GetActorName(targetActor),
-                        GetNodeLabel(targetNodeName), shrinkThresholdText, restoreThresholdText, lifetimeText));
+        PrintToConsole(fmt::format(
+            "RegisterBoneMonitor: monitoring {}.[{}] -> {}.{} (shrink {:.2f}, restore {:.2f}, lifetime until stopped)",
+            GetActorName(probeActor), JoinNodeLabels(probeNodes), GetActorName(targetActor),
+            GetNodeLabel(targetNodeName), distanceThreshold, restoreThreshold));
         return true;
     }
 
@@ -816,16 +841,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     return true;
 }
 
-// Plugin unload (if SKSE supports it in the future)
-// For now, we rely on game state messages to cleanup
-namespace {
-    struct PluginCleanup {
-        ~PluginCleanup() {
-            SKSE::log::info("Plugin cleanup triggered.");
-            Monitoring::Shutdown();
-        }
-    };
-
-    // This will be destroyed when the DLL unloads
-    PluginCleanup g_cleanup;
-}
+// Note: We intentionally do NOT use a global destructor for cleanup.
+// Static destruction order is undefined, and spdlog/SKSE statics may already
+// be destroyed when our destructor runs, causing crashes.
+// Instead, we rely on game state messages (kPostLoadGame, kNewGame) to cleanup,
+// which is the proper way to handle this in SKSE plugins.
