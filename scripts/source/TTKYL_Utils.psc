@@ -1,34 +1,5 @@
 scriptname TTKYL_Utils
 
-Function RestoreAll(int ThreadID) global
-    Actor[] actors = GetActors(ThreadID)
-    KnowYourLimits.ResetScaledBones()
-EndFunction
-
-Function StoreActors(int ThreadID, string prefix = "OStim") global
-    Actor[] actors = OThread.GetActors(ThreadID)
-    int i = 0
-    while(i < actors.Length)
-        StorageUtil.FormListAdd(none, prefix + "Thread" + ThreadID + "_Actors", actors[i])
-        i += 1
-    endwhile
-EndFunction
-
-Actor[] Function GetActors(int ThreadID, string prefix = "OStim") global
-    int count = StorageUtil.FormListCount(none, prefix + "Thread" + ThreadID + "_Actors")
-    Actor[] actors = PapyrusUtil.ActorArray(count)
-    int i = 0
-    while(i < count)
-        actors[i] = StorageUtil.FormListGet(none, prefix + "Thread" + ThreadID + "_Actors", i) as Actor
-        i += 1
-    endwhile
-    return actors
-EndFunction
-
-Function ClearActors(int ThreadID, string prefix = "OStim") global
-    StorageUtil.FormListClear(none, prefix + "Thread" + ThreadID + "_Actors")
-EndFunction
-
 float Function GetDistance(float[] pos1, float[] pos2) global
     return Math.Sqrt( (pos1[0]-pos2[0])*(pos1[0]-pos2[0]) + (pos1[1]-pos2[1])*(pos1[1]-pos2[1]) + (pos1[2]-pos2[2])*(pos1[2]-pos2[2]) )
 EndFunction
