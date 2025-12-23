@@ -61,7 +61,6 @@ EndFunction
 Function ApplyIntervalFromConfig() global
     int intervalMs = GetIntervalMs()
     KnowYourLimits.SetTickInterval(intervalMs)
-    MiscUtil.PrintConsole("TTKYL: Tick interval set to " + intervalMs + "ms from configuration")
 EndFunction
 
 string[] Function GetPenisBoneNames() global

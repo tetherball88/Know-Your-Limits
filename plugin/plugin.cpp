@@ -22,6 +22,7 @@
 #include "PCH.h"
 #include "RE/N/NiAVObject.h"
 #include "RE/R/ReferenceArray.h"
+#include "Logger.h"
 
 namespace {
     // Task interface pointer is obtained on demand using SKSE::GetTaskInterface();
@@ -38,25 +39,29 @@ namespace {
         if (!std::filesystem::is_directory(logPath)) {
             logPath = logPath.parent_path();
         }
+
+        // Get the DLL path for INI file location
+        std::filesystem::path iniPath;
+        HMODULE hModule = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)&SetupLogging, &hModule)) {
+            char dllPath[MAX_PATH];
+            GetModuleFileNameA(hModule, dllPath, MAX_PATH);
+            iniPath = std::filesystem::path(dllPath).parent_path() / "KnowYourLimits.ini";
+        } else {
+            // Fallback to log directory
+            iniPath = logPath.parent_path() / "KnowYourLimits.ini";
+        }
+
         logPath /= "KnowYourLimits.log";
 
-        std::error_code ec;
-        std::filesystem::create_directories(logPath.parent_path(), ec);
-        if (ec) {
+        // Initialize the logger with INI configuration
+        if (!KYL::Logger::GetInstance().Initialize(iniPath, logPath)) {
             if (auto* console = RE::ConsoleLog::GetSingleton()) {
-                console->Print("Know Your Limits: failed to create log folder (%s)", ec.message().c_str());
+                console->Print("Know Your Limits: failed to initialize logger");
             }
             return;
         }
-
-        auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logPath.string(), true);
-        auto logger = std::make_shared<spdlog::logger>("KnowYourLimits", std::move(sink));
-        logger->set_level(spdlog::level::debug);
-        logger->flush_on(spdlog::level::info);
-        logger->set_pattern("[%H:%M:%S] [%l] %v");
-
-        spdlog::set_default_logger(std::move(logger));
-        spdlog::info("Logging to {}", logPath.string());
     }
 
     std::string GetActorName(RE::Actor* actor) {
@@ -92,12 +97,6 @@ namespace {
         return result;
     }
 
-    void PrintToConsole(std::string_view message) {
-        SKSE::log::info("{}", message);
-        if (auto* console = RE::ConsoleLog::GetSingleton()) {
-            console->Print("%s", message.data());
-        }
-    }
 
     namespace Monitoring {
         struct MonitorEntry {
@@ -145,7 +144,7 @@ namespace {
             // Clamp interval to reasonable bounds (16ms to 1000ms)
             const int clampedInterval = std::clamp(intervalMs, 16, 1000);
             s_tickIntervalMs.store(clampedInterval, std::memory_order_relaxed);
-            SKSE::log::info("Tick interval set to {}ms", clampedInterval);
+            LOG_INFO("Tick interval set to {}ms", clampedInterval);
         }
 
         int GetTickInterval() {
@@ -169,7 +168,7 @@ namespace {
                 s_lastTickTime = std::chrono::steady_clock::now();
                 task->AddUITask([]() { ProcessTick(); });
             } else {
-                SKSE::log::critical("Task interface unavailable; cannot start monitor updates.");
+                LOG_CRITICAL("Task interface unavailable; cannot start monitor updates.");
             }
         }
 
@@ -183,7 +182,7 @@ namespace {
             auto* task = SKSE::GetTaskInterface();
             if (!task) {
                 s_uiTickActive.store(false, std::memory_order_release);
-                SKSE::log::critical("Task interface unavailable; stopping monitor updates.");
+                LOG_CRITICAL("Task interface unavailable; stopping monitor updates.");
                 return;
             }
 
@@ -225,7 +224,7 @@ namespace {
             s_shutdownCV.notify_all();
 
             s_uiTickActive.store(false, std::memory_order_release);
-            SKSE::log::info("Monitoring system stopped.");
+            LOG_INFO("Monitoring system stopped.");
         }
 
         void ResetShutdownState() {
@@ -250,11 +249,11 @@ namespace {
             auto* node = actor->GetNodeByName(nodeName);
 
             if (!node) {
-                SKSE::log::warn("RestoreBone: bone {} not found on actor {}", nodeName, GetActorName(actor));
+                LOG_WARN("RestoreBone: bone {} not found on actor {}", nodeName, GetActorName(actor));
                 return;
             }
 
-            SKSE::log::info("RestoreBone: {} restoring to originalY={:.3f}", nodeName.c_str(), 0.0f);
+            LOG_TRACE("RestoreBone: {} restoring to originalY={:.3f}", nodeName.c_str(), 0.0f);
 
             node->local.translate = RE::NiPoint3{0.0f, 0.0f, 0.0f};
 
@@ -276,7 +275,7 @@ namespace {
             for (std::size_t idx = 1; idx < entry.probeNodes.size() - 1; ++idx) {
                 if (entry.movedFlags[idx]) {
                     RestoreBonePosition(probeActor.get(), entry.probeNodes[idx]);
-                    SKSE::log::info("Restored bone {} for actor {}", GetNodeLabel(entry.probeNodes[idx]),
+                    LOG_TRACE("Restored bone {} for actor {}", GetNodeLabel(entry.probeNodes[idx]),
                                     GetActorName(probeActor.get()));
                 }
             }
@@ -290,7 +289,7 @@ namespace {
             auto* node = actor->GetNodeByName(nodeName);
 
             if (!node) {
-                SKSE::log::warn("MoveBone: bone {} not found on actor {}", nodeName, GetActorName(actor));
+                LOG_WARN("MoveBone: bone {} not found on actor {}", nodeName, GetActorName(actor));
                 return;
             }
             // Calculate how much to move the bone backwards along Y axis
@@ -310,7 +309,7 @@ namespace {
                 return;
             }
 
-            SKSE::log::info("MoveBone: {} originalY={:.3f} offset={:.3f} newY={:.3f}", nodeName.c_str(), 0.0f, yOffset,
+            LOG_TRACE("MoveBone: {} originalY={:.3f} offset={:.3f} newY={:.3f}", nodeName.c_str(), 0.0f, yOffset,
                             newPos.y);
 
             node->local.translate = newPos;
@@ -322,13 +321,13 @@ namespace {
                         RE::Actor* targetActor, const RE::BSFixedString& targetNodeName, float distanceThreshold,
                         float restoreThreshold) {
             if (!probeActor || !targetActor) {
-                SKSE::log::warn("AddMonitor rejected null actors (probe={}, target={})",
+                LOG_WARN("AddMonitor rejected null actors (probe={}, target={})",
                                 static_cast<const void*>(probeActor), static_cast<const void*>(targetActor));
                 return false;
             }
 
             if (probeNodeNames.empty()) {
-                SKSE::log::warn("AddMonitor rejected empty probe node list.");
+                LOG_WARN("AddMonitor rejected empty probe node list.");
                 return false;
             }
 
@@ -338,7 +337,7 @@ namespace {
             const auto targetHandle = targetActor->GetHandle().native_handle();
 
             if (probeHandle == 0 || targetHandle == 0) {
-                SKSE::log::warn("AddMonitor received actor with invalid handle (probe={}, target={})", probeHandle,
+                LOG_WARN("AddMonitor received actor with invalid handle (probe={}, target={})", probeHandle,
                                 targetHandle);
                 return false;
             }
@@ -381,7 +380,7 @@ namespace {
                 }
             }
 
-            SKSE::log::info(
+            LOG_INFO(
                 "{} bone monitor for {}.[{}] -> {}.{} (shrink threshold {:.2f}, restore threshold {:.2f}, lifetime "
                 "indefinite)",
                 updated ? "Updated" : "Created", GetActorName(probeActor), JoinNodeLabels(probeNodeNames),
@@ -436,7 +435,7 @@ namespace {
         }
 
         void Shutdown() {
-            SKSE::log::info("Shutting down monitoring system...");
+            LOG_INFO("Shutting down monitoring system...");
 
             // Stop all monitoring
             StopAllMonitoring();
@@ -453,11 +452,11 @@ namespace {
 
                 s_monitors.clear();
                 if (count > 0) {
-                    SKSE::log::info("Cleared {} monitor(s)", count);
+                    LOG_INFO("Cleared {} monitor(s)", count);
                 }
             }
 
-            SKSE::log::info("Monitoring system shutdown complete.");
+            LOG_INFO("Monitoring system shutdown complete.");
         }
 
         void ProcessTick() {
@@ -483,7 +482,7 @@ namespace {
                 auto& entry = s_monitors[monitorIdx];
 
                 if (entry.probeNodes.empty()) {
-                    SKSE::log::warn("Removing monitor with no probe nodes (probeHandle={:#x} targetHandle={:#x})",
+                    LOG_WARN("Removing monitor with no probe nodes (probeHandle={:#x} targetHandle={:#x})",
                                     entry.probeHandle, entry.targetHandle);
                     monitorsToRemove.push_back(monitorIdx);
                     continue;
@@ -496,7 +495,7 @@ namespace {
                 const bool targetValid = static_cast<bool>(targetActor);
 
                 if (!probeValid || !targetValid) {
-                    SKSE::log::info("Removing monitor (missing actor) probeHandle={:#x} targetHandle={:#x}",
+                    LOG_INFO("Removing monitor (missing actor) probeHandle={:#x} targetHandle={:#x}",
                                     entry.probeHandle, entry.targetHandle);
                     monitorsToRemove.push_back(monitorIdx);
                     continue;
@@ -544,7 +543,7 @@ namespace {
                 if (!targetNode || !baseNode || !tipNode || middleBones.empty()) {
                     if (!entry.waitingForBones) {
                         entry.waitingForBones = true;
-                        SKSE::log::info(
+                        LOG_INFO(
                             "Waiting for bones (probeHandle={:#x} targetHandle={:#x} target={} base={} tip={} "
                             "middle={})",
                             entry.probeHandle, entry.targetHandle, targetNode ? "ok" : "missing",
@@ -555,7 +554,7 @@ namespace {
 
                 if (entry.waitingForBones) {
                     entry.waitingForBones = false;
-                    SKSE::log::info("Bones recovered (probeHandle={:#x} targetHandle={:#x})", entry.probeHandle,
+                    LOG_INFO("Bones recovered (probeHandle={:#x} targetHandle={:#x})", entry.probeHandle,
                                     entry.targetHandle);
                 }
 
@@ -571,7 +570,7 @@ namespace {
 
                 if (probeLength < 0.001f) {
                     // Probe bones are too close together, can't determine direction
-                    SKSE::log::debug("Probe bones too close together (probeHandle={:#x})", entry.probeHandle);
+                    LOG_DEBUG("Probe bones too close together (probeHandle={:#x})", entry.probeHandle);
                     continue;
                 }
 
@@ -586,7 +585,7 @@ namespace {
                 // Negative = probe hasn't reached target yet
                 float tipPenetration = targetToTip.Dot(probeDirection);
 
-                SKSE::log::info(
+                LOG_TRACE(
                     "Penetration check: probeHandle={:#x} tipPenetration={:.3f} shrinkThreshold={:.3f} "
                     "restoreThreshold={:.3f}",
                     entry.probeHandle, tipPenetration, entry.distanceThreshold, entry.restoreThreshold);
@@ -595,7 +594,7 @@ namespace {
                     // Track max for telemetry, but drive offset from cached maximum beyond threshold
                     if (tipPenetration > entry.maxPenetration) {
                         entry.maxPenetration = tipPenetration;
-                        SKSE::log::debug("New max penetration: {:.3f} (probeHandle={:#x})", entry.maxPenetration,
+                        LOG_DEBUG("New max penetration: {:.3f} (probeHandle={:#x})", entry.maxPenetration,
                                          entry.probeHandle);
                     }
 
@@ -604,7 +603,7 @@ namespace {
                     if (currentBeyondThreshold > entry.maxPenetrationBeyondThreshold) {
                         entry.maxPenetrationBeyondThreshold = currentBeyondThreshold;
                         newMaxBeyond = true;
-                        SKSE::log::debug("New max penetration beyond threshold: {:.3f} (probeHandle={:#x})",
+                        LOG_DEBUG("New max penetration beyond threshold: {:.3f} (probeHandle={:#x})",
                                          entry.maxPenetrationBeyondThreshold, entry.probeHandle);
                     }
 
@@ -630,7 +629,7 @@ namespace {
                         entry.movedFlags[boneIdx] = true;
 
                         if (!wasMoved) {
-                            SKSE::log::info(
+                            LOG_TRACE(
                                 "Moved bone (probeHandle={:#x} node={} distributedOffset={:.2f} tipPenetration={:.2f} "
                                 "maxPenetration={:.2f} threshold={:.2f})",
                                 entry.probeHandle, GetNodeLabel(entry.probeNodes[boneIdx]), distributedOffset,
@@ -644,7 +643,7 @@ namespace {
                         if (entry.movedFlags[boneIdx]) {
                             RestoreBonePosition(probeActor.get(), entry.probeNodes[boneIdx]);
                             entry.movedFlags[boneIdx] = false;
-                            SKSE::log::info(
+                            LOG_TRACE(
                                 "Restored bone (probeHandle={:#x} node={} tipPenetration={:.2f} "
                                 "restoreThreshold={:.2f})",
                                 entry.probeHandle, GetNodeLabel(entry.probeNodes[boneIdx]), tipPenetration,
@@ -668,7 +667,7 @@ namespace {
             if (s_monitors.empty()) {
                 // Use atomic instead of mutex to avoid potential deadlock
                 s_uiTickActive.store(false, std::memory_order_release);
-                SKSE::log::info("No more active monitors, stopping tick.");
+                LOG_INFO("No more active monitors, stopping tick.");
                 return;
             }
 
@@ -682,19 +681,19 @@ namespace Papyrus {
     bool RegisterBoneMonitor(RE::StaticFunctionTag*, RE::Actor* probeActor,
                              RE::reference_array<RE::BSFixedString> probeNodeNames, RE::Actor* targetActor,
                              RE::BSFixedString targetNodeName, float distanceThreshold, float restoreThreshold) {
-        SKSE::log::info(
+        LOG_INFO(
             "RegisterBoneMonitor invoked (probeActor={}, targetActor={}, shrinkThreshold={:.2f}, "
             "restoreThreshold={:.2f}, probeNodes={})",
             static_cast<const void*>(probeActor), static_cast<const void*>(targetActor), distanceThreshold,
             restoreThreshold, probeNodeNames.size());
 
         if (!probeActor || !targetActor) {
-            PrintToConsole("RegisterBoneMonitor: invalid actor arguments.");
+            LOG_ERROR("RegisterBoneMonitor: invalid actor arguments.");
             return false;
         }
 
         if (probeNodeNames.empty()) {
-            PrintToConsole("RegisterBoneMonitor: probe node list must be non-empty.");
+            LOG_ERROR("RegisterBoneMonitor: probe node list must be non-empty.");
             return false;
         }
 
@@ -703,7 +702,7 @@ namespace Papyrus {
         for (const auto& name : probeNodeNames) {
             const char* data = name.data();
             if (!data || *data == '\0') {
-                PrintToConsole("RegisterBoneMonitor: probe node names must be non-empty.");
+                LOG_ERROR("RegisterBoneMonitor: probe node names must be non-empty.");
                 return false;
             }
             probeNodes.push_back(name);
@@ -711,26 +710,25 @@ namespace Papyrus {
 
         // Require at least base, middle, and tip bones
         if (probeNodes.size() < 3) {
-            PrintToConsole("RegisterBoneMonitor: probe node list must contain at least 3 nodes (base, middle, tip).");
+            LOG_ERROR("RegisterBoneMonitor: probe node list must contain at least 3 nodes (base, middle, tip).");
             return false;
         }
 
         const char* targetNodeData = targetNodeName.data();
         if (!targetNodeData || *targetNodeData == '\0') {
-            PrintToConsole("RegisterBoneMonitor: target node name must be non-empty.");
+            LOG_ERROR("RegisterBoneMonitor: target node name must be non-empty.");
             return false;
         }
 
         if (!Monitoring::AddMonitor(probeActor, probeNodes, targetActor, targetNodeName, distanceThreshold,
                                     restoreThreshold)) {
-            PrintToConsole("RegisterBoneMonitor: failed to start monitoring.");
+            LOG_ERROR("RegisterBoneMonitor: failed to start monitoring.");
             return false;
         }
 
-        PrintToConsole(fmt::format(
-            "RegisterBoneMonitor: monitoring {}.[{}] -> {}.{} (shrink {:.2f}, restore {:.2f}, lifetime until stopped)",
+        LOG_INFO("RegisterBoneMonitor: monitoring {}.[{}] -> {}.{} (shrink {:.2f}, restore {:.2f}, lifetime until stopped)",
             GetActorName(probeActor), JoinNodeLabels(probeNodes), GetActorName(targetActor),
-            GetNodeLabel(targetNodeName), distanceThreshold, restoreThreshold));
+            GetNodeLabel(targetNodeName), distanceThreshold, restoreThreshold);
         return true;
     }
 
@@ -748,36 +746,34 @@ namespace Papyrus {
         }
 
         const auto removed = Monitoring::RemoveMonitors(handles);
-        SKSE::log::info("StopBoneMonitor invoked (requested actors={}, removed monitors={})", handles.size(), removed);
+        LOG_INFO("StopBoneMonitor invoked (requested actors={}, removed monitors={})", handles.size(), removed);
         if (removed == 0) {
             if (handles.empty()) {
-                PrintToConsole("StopBoneMonitor: no active monitors.");
+                LOG_WARN("StopBoneMonitor: no active monitors.");
             } else {
-                PrintToConsole(fmt::format("StopBoneMonitor: no monitors matched {} actor(s).", handles.size()));
+                LOG_WARN("StopBoneMonitor: no monitors matched {} actor(s).", handles.size());
             }
             return false;
         }
 
         if (handles.empty()) {
-            PrintToConsole(fmt::format("StopBoneMonitor: stopped all {} monitor(s).", removed));
+            LOG_INFO("StopBoneMonitor: stopped all {} monitor(s).", removed);
         } else {
-            PrintToConsole(
-                fmt::format("StopBoneMonitor: stopped {} monitor(s) for {} actor(s).", removed, handles.size()));
+            LOG_INFO("StopBoneMonitor: stopped {} monitor(s) for {} actor(s).", removed, handles.size());
         }
 
-        SKSE::log::info("StopBoneMonitor removed {} monitor(s)", removed);
         return true;
     }
 
     void SetTickInterval(RE::StaticFunctionTag*, int intervalMs) {
-        SKSE::log::info("SetTickInterval invoked (intervalMs={})", intervalMs);
+        LOG_INFO("SetTickInterval invoked (intervalMs={})", intervalMs);
         Monitoring::SetTickInterval(intervalMs);
-        PrintToConsole(fmt::format("SetTickInterval: interval set to {}ms", Monitoring::GetTickInterval()));
+        LOG_INFO("SetTickInterval: interval set to {}ms", Monitoring::GetTickInterval());
     }
 
     int GetTickInterval(RE::StaticFunctionTag*) {
         const int interval = Monitoring::GetTickInterval();
-        SKSE::log::info("GetTickInterval invoked, returning {}ms", interval);
+        LOG_INFO("GetTickInterval invoked, returning {}ms", interval);
         return interval;
     }
 
@@ -786,7 +782,7 @@ namespace Papyrus {
         vm->RegisterFunction("StopBoneMonitor"sv, "KnowYourLimits"sv, StopBoneMonitor);
         vm->RegisterFunction("SetTickInterval"sv, "KnowYourLimits"sv, SetTickInterval);
         vm->RegisterFunction("GetTickInterval"sv, "KnowYourLimits"sv, GetTickInterval);
-        SKSE::log::info("Papyrus functions registered.");
+        LOG_INFO("Papyrus functions registered.");
         return true;
     }
 }  // namespace Papyrus
@@ -795,7 +791,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::Init(skse);
 
     SetupLogging();
-    SKSE::log::info("Know Your Limits plugin loading...");
+    LOG_INFO("Know Your Limits plugin loading...");
 
     // Note: monitoring code obtains the task interface lazily with SKSE::GetTaskInterface().
 
@@ -804,12 +800,12 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
                 switch (message->type) {
                     case SKSE::MessagingInterface::kPostLoadGame:
                     case SKSE::MessagingInterface::kNewGame:
-                        SKSE::log::info("New game/Load: cleaning up monitoring system and restoring bones.");
+                        LOG_INFO("New game/Load: cleaning up monitoring system and restoring bones.");
                         Monitoring::Shutdown();
                         break;
 
                     case SKSE::MessagingInterface::kDataLoaded:
-                        SKSE::log::info("Data loaded successfully.");
+                        LOG_INFO("Data loaded successfully.");
                         if (auto* console = RE::ConsoleLog::GetSingleton()) {
                             console->Print("Know Your Limits: Ready");
                         }
@@ -819,25 +815,25 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
                         break;
                 }
             })) {
-            SKSE::log::critical("Failed to register messaging listener.");
+            LOG_CRITICAL("Failed to register messaging listener.");
             return false;
         }
     } else {
-        SKSE::log::critical("Messaging interface unavailable.");
+        LOG_CRITICAL("Messaging interface unavailable.");
         return false;
     }
 
     if (const auto* papyrus = SKSE::GetPapyrusInterface()) {
         if (!papyrus->Register(Papyrus::RegisterFunctions)) {
-            SKSE::log::critical("Failed to register Papyrus functions.");
+            LOG_CRITICAL("Failed to register Papyrus functions.");
             return false;
         }
     } else {
-        SKSE::log::critical("Papyrus interface unavailable.");
+        LOG_CRITICAL("Papyrus interface unavailable.");
         return false;
     }
 
-    SKSE::log::info("Know Your Limits plugin loaded successfully.");
+    LOG_INFO("Know Your Limits plugin loaded successfully.");
     return true;
 }
 
